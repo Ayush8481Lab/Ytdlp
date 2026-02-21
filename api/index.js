@@ -1,86 +1,77 @@
-const chromium = require('@sparticuz/chromium');
-const puppeteer = require('puppeteer-core');
-const YTDlpWrap = require('yt-dlp-wrap').default;
-const fs = require('fs');
-const path = require('path');
+from flask import Flask, request, jsonify
+import yt_dlp
+import os
+import tempfile
+import base64
 
-// Setup yt-dlp binary in /tmp (writable folder)
-const setupYtDlp = async () => {
-    const filePath = path.join('/tmp', 'yt-dlp');
-    if (!fs.existsSync(filePath)) {
-        // Downloads the binary if not present
-        await YTDlpWrap.downloadFromGithub(filePath);
-        fs.chmodSync(filePath, '755'); // Make executable
-    }
-    return new YTDlpWrap(filePath);
-};
+app = Flask(__name__)
 
-export default async function handler(req, res) {
-    // 1. Get URL from request
-    const { url } = req.query;
-    if (!url) return res.status(400).json({ error: 'Send a url param like ?url=...' });
+def get_cookies_path():
+    # 1. Check if the environment variable exists
+    cookies_content = os.environ.get('YOUTUBE_COOKIES')
+    
+    if not cookies_content:
+        return None
 
-    let browser = null;
+    # 2. Decode base64 cookies and write to a temp file
+    try:
+        # Create a temp file that persists only for this function run
+        temp = tempfile.NamedTemporaryFile(delete=False, mode='w+', suffix='.txt')
+        # We expect the env var to be Base64 encoded to handle newlines correctly
+        decoded_content = base64.b64decode(cookies_content).decode('utf-8')
+        temp.write(decoded_content)
+        temp.close()
+        return temp.name
+    except Exception as e:
+        print(f"Error processing cookies: {e}")
+        return None
 
-    try {
-        // 2. Launch Mini Browser (Puppeteer)
-        browser = await puppeteer.launch({
-            args: [...chromium.args, "--hide-scrollbars", "--disable-web-security"],
-            defaultViewport: chromium.defaultViewport,
-            executablePath: await chromium.executablePath(),
-            headless: chromium.headless,
-            ignoreHTTPSErrors: true,
-        });
+@app.route('/api/extract', methods=['GET'])
+def extract_video():
+    video_url = request.args.get('url')
+    
+    if not video_url:
+        return jsonify({"error": "Missing URL parameter"}), 400
 
-        const page = await browser.newPage();
-        
-        // Use a real Mobile User-Agent to look like your phone
-        const userAgent = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Mobile Safari/537.36";
-        await page.setUserAgent(userAgent);
+    cookie_file = get_cookies_path()
 
-        // 3. Go to YouTube to get "Fresh" Cookies
-        // We go to the embed URL because it loads faster than the full site
-        const videoId = url.split('v=')[1]?.split('&')[0] || url.split('/').pop();
-        await page.goto(`https://www.youtube.com/embed/${videoId}`, { 
-            waitUntil: 'domcontentloaded', 
-            timeout: 8000 
-        });
+    try:
+        ydl_opts = {
+            'format': 'best',
+            'quiet': True,
+            'no_warnings': True,
+            'noplaylist': True,
+            'socket_timeout': 10,
+            # Spoof User Agent to look like a standard browser
+            'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+        }
 
-        // Extract cookies from the browser session
-        const cookies = await page.cookies();
-        
-        // Format cookies for yt-dlp (Netscape format)
-        const cookieContent = cookies.map(c => {
-            return `${c.domain}\tTRUE\t${c.path}\t${c.secure}\t${c.expires}\t${c.name}\t${c.value}`;
-        }).join('\n');
-        
-        const cookiePath = '/tmp/cookies.txt';
-        fs.writeFileSync(cookiePath, '# Netscape HTTP Cookie File\n' + cookieContent);
+        # If we successfully created a cookie file, use it
+        if cookie_file:
+            ydl_opts['cookiefile'] = cookie_file
 
-        // 4. Run yt-dlp with the cookies
-        const ytDlp = await setupYtDlp();
-        
-        // Get the direct link (-g)
-        const output = await ytDlp.execPromise([
-            url,
-            '-g', // Get URL only
-            '--cookies', cookiePath,
-            '--user-agent', userAgent,
-            '-f', 'best[ext=mp4]/best', // Best MP4
-        ]);
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(video_url, download=False)
+            
+            direct_url = info.get('url', None)
+            title = info.get('title', 'Unknown')
+            thumbnail = info.get('thumbnail', None)
+            
+            # Clean up temp file
+            if cookie_file and os.path.exists(cookie_file):
+                os.remove(cookie_file)
 
-        res.status(200).json({ 
-            link: output.trim(),
-            status: "Success"
-        });
+            return jsonify({
+                "title": title,
+                "stream_url": direct_url,
+                "thumbnail": thumbnail
+            })
 
-    } catch (error) {
-        console.error(error);
-        res.status(500).json({ 
-            error: error.message,
-            tip: "If timeout, try again. Vercel Free tier has 10s limit." 
-        });
-    } finally {
-        if (browser) await browser.close();
-    }
-}
+    except Exception as e:
+        # Clean up temp file in case of error
+        if cookie_file and os.path.exists(cookie_file):
+            os.remove(cookie_file)
+        return jsonify({"error": str(e)}), 500
+
+if __name__ == '__main__':
+    app.run()
