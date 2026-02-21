@@ -1,0 +1,10 @@
+{
+  "name": "yt-proxy",
+  "version": "1.0.0",
+  "main": "api/index.js",
+  "dependencies": {
+    "@sparticuz/chromium": "119.0.0",
+    "puppeteer-core": "21.5.2",
+    "yt-dlp-wrap": "latest"
+  }
+}
