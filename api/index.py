@@ -1,79 +1,76 @@
 from flask import Flask, request, jsonify
-import yt_dlp
-import os
-import tempfile
-import base64
+import requests
 import random
 
 app = Flask(__name__)
 
-def get_cookies_path():
-    cookies_content = os.environ.get('YOUTUBE_COOKIES')
-    if not cookies_content:
-        return None
-    try:
-        temp = tempfile.NamedTemporaryFile(delete=False, mode='w+', suffix='.txt')
-        decoded_content = base64.b64decode(cookies_content).decode('utf-8')
-        temp.write(decoded_content)
-        temp.close()
-        return temp.name
-    except Exception as e:
-        return None
+# List of public Cobalt instances (Privacy-focused YouTube downloaders)
+# We use multiple in case one is down or blocked.
+COBALT_INSTANCES = [
+    "https://api.cobalt.tools",           # Official (Best, but sometimes strict)
+    "https://cobalt.gaia.domains",        # Community Instance
+    "https://cobalt.moskas.cyou",         # Community Instance
+    "https://cobalt.kwiatekmiki.pl",      # Community Instance
+]
 
 @app.route('/api/extract', methods=['GET'])
 def extract_video():
     video_url = request.args.get('url')
+    
     if not video_url:
         return jsonify({"error": "Missing URL parameter"}), 400
 
-    cookie_file = get_cookies_path()
-    
-    # Get PO Token from Vercel Env Vars (Optional but Recommended)
-    po_token = os.environ.get('YOUTUBE_PO_TOKEN')
-    
-    # 1. Setup Extractor Arguments to bypass bot checks
-    # We tell YouTube we are an Android device or TV, which often bypasses the "Sign in" error.
-    extractor_args = {
-        'youtube': {
-            'player_client': ['android', 'ios', 'web_embedded'],
-            'player_skip': ['webpage', 'configs', 'js'], 
-            'include_ssl_logs': [False] 
-        }
+    # 1. Prepare the request payload for Cobalt
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
     
-    # If you provide a PO Token, we inject it here
-    if po_token:
-        # Format: web+<your_token_here>
-        extractor_args['youtube']['po_token'] = [f'web+{po_token}']
+    payload = {
+        "url": video_url,
+        "vCodec": "h264",  # Ensure compatibility
+        "vQuality": "720", # Good balance for mobile
+        "aFormat": "mp3",  # Best audio compatibility
+        "isAudioOnly": False
+    }
 
-    try:
-        ydl_opts = {
-            'format': 'best',
-            'quiet': True,
-            'no_warnings': True,
-            'noplaylist': True,
-            'cookiefile': cookie_file,
-            'extractor_args': extractor_args,
-            # Use a generic mobile user agent
-            'user_agent': 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36',
-            'socket_timeout': 15,
-        }
-
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(video_url, download=False)
+    # 2. Try each instance until one works
+    last_error = ""
+    for base_url in COBALT_INSTANCES:
+        try:
+            # Cobalt API endpoint is usually at /api/json or root depending on version
+            # We try the standard v7+ endpoint
+            api_url = f"{base_url}/api/json"
             
-            return jsonify({
-                "title": info.get('title', 'Unknown'),
-                "stream_url": info.get('url', None),
-                "thumbnail": info.get('thumbnail', None),
-                "duration": info.get('duration', None)
-            })
+            response = requests.post(api_url, json=payload, headers=headers, timeout=8)
+            data = response.json()
 
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-    finally:
-        if cookie_file and os.path.exists(cookie_file):
-            os.remove(cookie_file)
+            # 3. Check for success
+            if response.status_code == 200 and 'url' in data:
+                return jsonify({
+                    "title": "Video Found", 
+                    "stream_url": data['url'],
+                    "source": base_url # Debug info to see which server worked
+                })
+            
+            # If successful but "status" is "stream" or "redirect"
+            if data.get('status') in ['stream', 'redirect', 'tunnel']:
+                return jsonify({
+                    "title": "Video Found",
+                    "stream_url": data.get('url'),
+                    "source": base_url
+                })
+
+        except Exception as e:
+            last_error = str(e)
+            continue # Try the next server
+
+    # 4. If all fail
+    return jsonify({
+        "error": "All servers failed. YouTube might be blocking heavily right now.",
+        "details": last_error
+    }), 500
 
 if __name__ == '__main__':
     app.run()
